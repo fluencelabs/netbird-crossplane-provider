@@ -204,7 +204,17 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		meta.SetExternalName(cr, *policy.Id)
 	}
 
-	uptodate := IsApiToNBPolicyUpToDate(cr.Spec.ForProvider, policy, c)
+	// The spec may reference groups by name; resolve them against the current
+	// group list so the comparison is by id.
+	groups, err := client.Groups.List(ctx)
+	if err != nil {
+		if auth.IsTokenInvalidError(err) {
+			c.authManager.ForceRefresh(ctx)
+			return managed.ExternalObservation{}, err
+		}
+		return managed.ExternalObservation{}, errors.Wrap(err, "failed to list groups")
+	}
+	uptodate := IsApiToNBPolicyUpToDate(cr.Spec.ForProvider, policy, groups, c)
 	cr.Status.AtProvider = v1alpha1.NbPolicyObservation{
 		Id:                  policy.Id,
 		Enabled:             policy.Enabled,
@@ -398,28 +408,80 @@ func NbToApiPortRanges(rulePortRange *[]v1alpha1.RulePortRange) *[]nbapi.RulePor
 	return &rportrange
 }
 
+// NbToApiGroupMinimums resolves the spec's group references into the group ids
+// the netbird API expects, in spec order. Each entry is matched by Id first and,
+// when the Id is absent or matches no group, by Name. Every entry must resolve:
+// an unknown reference, or a Name carried by more than one group (netbird allows
+// duplicate group names), is an error naming the entry, so the API is never sent
+// an empty or arbitrarily chosen id. A nil list resolves to nil.
 func NbToApiGroupMinimums(groupMinimums *[]v1alpha1.GroupMinimum, groups []nbapi.Group) (*[]string, error) {
-	ids := make([]string, len(*groupMinimums))
-	err := errors.New("couldnt resolve group")
-	for i, gmin := range *groupMinimums {
-		for _, group := range groups {
-			if gmin.Id != nil && group.Id == *gmin.Id {
-				ids[i] = group.Id
-				err = nil
-				break
-			} else {
-				if gmin.Name != nil && group.Name == *gmin.Name {
-					ids[i] = group.Id
-					err = nil
-					break
-				}
-			}
-		}
+	if groupMinimums == nil {
+		return nil, nil
 	}
-	return &ids, err
+	ids := make([]string, len(*groupMinimums))
+	for i, gmin := range *groupMinimums {
+		id, err := resolveGroupID(gmin, groups)
+		if err != nil {
+			return nil, err
+		}
+		ids[i] = id
+	}
+	return &ids, nil
 }
 
-func IsApiToNBPolicyUpToDate(nbPolicy v1alpha1.NbPolicyParameters, policy *nbapi.Policy, c *external) bool {
+// resolveGroupID resolves one group reference against the account's groups.
+func resolveGroupID(gmin v1alpha1.GroupMinimum, groups []nbapi.Group) (string, error) {
+	hasID := gmin.Id != nil && *gmin.Id != ""
+	hasName := gmin.Name != nil && *gmin.Name != ""
+	if hasID {
+		for _, group := range groups {
+			if group.Id == *gmin.Id {
+				return group.Id, nil
+			}
+		}
+		if !hasName {
+			return "", errors.Errorf("group not found by id: %q", *gmin.Id)
+		}
+	}
+	if !hasName {
+		return "", errors.New("group reference missing both id and name")
+	}
+	var matched []string
+	for _, group := range groups {
+		if group.Name == *gmin.Name {
+			matched = append(matched, group.Id)
+		}
+	}
+	switch len(matched) {
+	case 0:
+		return "", errors.Errorf("group not found by name: %q", *gmin.Name)
+	case 1:
+		return matched[0], nil
+	default:
+		return "", errors.Errorf("group name %q is ambiguous: %d groups carry it (ids %s); reference it by id", *gmin.Name, len(matched), strings.Join(matched, ", "))
+	}
+}
+
+// groupIDsMatch reports whether the API rule's groups are, position by position,
+// the groups the spec resolves to. A spec that cannot be resolved never matches:
+// the resulting Update surfaces the resolution error.
+func groupIDsMatch(api *[]v1alpha1.GroupMinimum, spec *[]v1alpha1.GroupMinimum, groups []nbapi.Group) (bool, error) {
+	if api == nil || spec == nil || len(*api) != len(*spec) {
+		return false, nil
+	}
+	resolved, err := NbToApiGroupMinimums(spec, groups)
+	if err != nil {
+		return false, err
+	}
+	for j, id := range *resolved {
+		if (*api)[j].Id == nil || *(*api)[j].Id != id {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func IsApiToNBPolicyUpToDate(nbPolicy v1alpha1.NbPolicyParameters, policy *nbapi.Policy, groups []nbapi.Group, c *external) bool {
 	c.log.Info("Checking if API policy is up to date", "policy", policy)
 	c.log.Info("Checking if API policy is up to date", "nbPolicy", nbPolicy)
 	if nbPolicy.Rules == nil || policy.Rules == nil {
@@ -446,31 +508,15 @@ func IsApiToNBPolicyUpToDate(nbPolicy v1alpha1.NbPolicyParameters, policy *nbapi
 			c.log.Info("bidirectional doesn't match")
 			return false
 		}
-		// Compare only the Id field of each destination
-		destA := policyrule.Destinations
-		destB := nbPolicy.Rules[i].Destinations
-		if destA == nil || destB == nil || len(*destA) != len(*destB) {
-			c.log.Info("destinations length doesn't match or is nil")
+		// Compare the API's group ids with the ids the spec resolves to, so a
+		// group referenced by name only is compared too.
+		if ok, err := groupIDsMatch(policyrule.Destinations, nbPolicy.Rules[i].Destinations, groups); !ok {
+			c.log.Info("destinations don't match", "error", err)
 			return false
 		}
-		for j := range *destA {
-			if (*destA)[j].Id == nil || (*destB)[j].Id == nil || *(*destA)[j].Id != *(*destB)[j].Id {
-				c.log.Info("destination id doesn't match", "index", j)
-				return false
-			}
-		}
-		// Compare only the Id field of each source
-		srcA := policyrule.Sources
-		srcB := nbPolicy.Rules[i].Sources
-		if srcA == nil || srcB == nil || len(*srcA) != len(*srcB) {
-			c.log.Info("sources length doesn't match or is nil")
+		if ok, err := groupIDsMatch(policyrule.Sources, nbPolicy.Rules[i].Sources, groups); !ok {
+			c.log.Info("sources don't match", "error", err)
 			return false
-		}
-		for j := range *srcA {
-			if (*srcA)[j].Id == nil || (*srcB)[j].Id == nil || *(*srcA)[j].Id != *(*srcB)[j].Id {
-				c.log.Info("source id doesn't match", "index", j)
-				return false
-			}
 		}
 		// PortRanges nil check and comparison
 		if policyrule.PortRanges == nil && nbPolicy.Rules[i].PortRanges != nil {
